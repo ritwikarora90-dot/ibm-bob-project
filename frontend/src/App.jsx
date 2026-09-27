@@ -4,6 +4,7 @@ import "./App.css";
 import Navbar from "./components/Navbar";
 
 import Home from "./pages/Home";
+import AutoPipeline from "./pages/AutoPipeline";
 import Analyze from "./pages/Analyze";
 import Optimization from "./pages/Optimization";
 import SecurityPatch from "./pages/SecurityPatch";
@@ -16,6 +17,7 @@ function App() {
       <Navbar />
       <Routes>
         <Route path="/" element={<Home />} />
+        <Route path="/pipeline" element={<AutoPipeline />} />
         <Route path="/analyze" element={<Analyze />} />
         <Route path="/optimization" element={<Optimization />} />
         <Route path="/security" element={<SecurityPatch />} />

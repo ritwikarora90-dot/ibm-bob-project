@@ -1,13 +1,18 @@
 import ast
 import re
 import time
-from fastapi import FastAPI
+import os
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from parser import parse_python_traceback
+
+# Import the IBM Granite foundation model service
+from watsonx_service import query_watsonx_agent
 
 app = FastAPI(title="CodeOpt AI Backend", version="2.0")
 
+# Enable CORS for local Vite development and Vercel cloud frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,326 +21,356 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------------
+# Pydantic Schemas
+# ---------------------------------------------------------------------------
+
 class CodeRequest(BaseModel):
     code: str
 
+class IncidentRequest(BaseModel):
+    code: Optional[str] = ""
+    traceback: Optional[str] = ""
 
-# Helper to analyze AST loop complexity
-def detect_ast_complexity(code_str: str):
+class SecurityRequest(BaseModel):
+    code: str
+
+class VerificationRequest(BaseModel):
+    code: str
+
+class PipelineRequest(BaseModel):
+    code: str
+    traceback: Optional[str] = ""
+
+class UniversalTaskRequest(BaseModel):
+    instruction: str
+    code_or_input: str
+    language: Optional[str] = "python"
+
+
+# ---------------------------------------------------------------------------
+# AST & Algorithmic Analysis Helpers
+# ---------------------------------------------------------------------------
+
+class LoopDepthVisitor(ast.NodeVisitor):
+    def __init__(self):
+        self.current_depth = 0
+        self.max_depth = 0
+
+    def visit_For(self, node):
+        self.current_depth += 1
+        self.max_depth = max(self.max_depth, self.current_depth)
+        self.generic_visit(node)
+        self.current_depth -= 1
+
+    def visit_While(self, node):
+        self.current_depth += 1
+        self.max_depth = max(self.max_depth, self.current_depth)
+        self.generic_visit(node)
+        self.current_depth -= 1
+
+
+def detect_ast_complexity(code_str: str) -> tuple[str, List[str]]:
     try:
         tree = ast.parse(code_str)
-    except Exception:
-        return "Unknown (Syntax Error)", ["Code could not be parsed via AST."]
-    
-    class LoopVisitor(ast.NodeVisitor):
-        def __init__(self):
-            self.current_depth = 0
-            self.max_depth = 0
+    except SyntaxError as e:
+        return "Unknown (Syntax Error)", [f"Syntax Error on line {e.lineno}: {e.msg}"]
+    except Exception as e:
+        return "Unknown", [str(e)]
 
-        def visit_For(self, node):
-            self.current_depth += 1
-            self.max_depth = max(self.max_depth, self.current_depth)
-            self.generic_visit(node)
-            self.current_depth -= 1
-
-        def visit_While(self, node):
-            self.current_depth += 1
-            self.max_depth = max(self.max_depth, self.current_depth)
-            self.generic_visit(node)
-            self.current_depth -= 1
-
-    visitor = LoopVisitor()
+    visitor = LoopDepthVisitor()
     visitor.visit(tree)
 
-    recommendations = []
-    if visitor.max_depth >= 2:
-        complexity = f"O(N^{visitor.max_depth})"
-        recommendations.append(f"Detected {visitor.max_depth} nested loops. Consider hashing or pre-indexing to reduce to O(N).")
+    details = []
+    if visitor.max_depth == 0:
+        complexity = "O(1)"
+        details.append("No loops detected. Constant time execution.")
     elif visitor.max_depth == 1:
         complexity = "O(N)"
-        recommendations.append("Linear loop detected. Optimal for sequential scans.")
+        details.append("Single loop detected. Linear time complexity.")
+    elif visitor.max_depth == 2:
+        complexity = "O(N^2)"
+        details.append("Nested loop detected (depth 2). Quadratic time complexity bottleneck.")
     else:
-        complexity = "O(1)"
-        recommendations.append("Constant or direct execution detected.")
+        complexity = f"O(N^{visitor.max_depth})"
+        details.append(f"Deeply nested loops detected (depth {visitor.max_depth}). High latency risk.")
 
-    return complexity, recommendations
+    return complexity, details
 
 
-# 1. Incident Analysis Endpoint
-@app.post("/analyze")
-def analyze(data: CodeRequest):
-    parsed = parse_python_traceback(data.code)
-    error_type = parsed.get("error_type", "Unknown Error")
-    file_info = parsed.get("file", "Unknown")
-    line_info = parsed.get("line")
+def scan_cwe_vulnerabilities(code_str: str) -> List[Dict[str, Any]]:
+    issues = []
     
-    suggestions = []
-    if line_info:
-        suggestions.append(f"Incident triggered in '{file_info}' at line {line_info}.")
-    
-    if "KeyError" in error_type:
-        suggestions.append("Missing dictionary key access. Replace raw bracket indexing with .get() fallback.")
-        hotfix = "# Recommended Hotfix:\nuser_id = payload.get('user_id', None)\nif not user_id:\n    raise ValueError('Missing required user_id')"
-    elif "IndexError" in error_type:
-        suggestions.append("List index out of range. Check sequence length or use slicing.")
-        hotfix = "# Recommended Hotfix:\nif index < len(my_list):\n    item = my_list[index]\nelse:\n    item = None"
-    elif "ZeroDivisionError" in error_type:
-        suggestions.append("Attempted division by zero. Validate denominator boundary prior to arithmetic.")
-        hotfix = "# Recommended Hotfix:\nresult = numerator / denominator if denominator != 0 else 0.0"
-    elif "TypeError" in error_type:
-        suggestions.append("Type mismatch detected. Enforce strict type conversions or duck-typing guards.")
-        hotfix = "# Recommended Hotfix:\nparam_a = str(param_a) if not isinstance(param_a, str) else param_a"
-    elif "AttributeError" in error_type:
-        suggestions.append("Attempted attribute call on None or mismatched object type.")
-        hotfix = "# Recommended Hotfix:\nif obj is not None and hasattr(obj, 'target_method'):\n    obj.target_method()"
-    else:
-        suggestions.append(f"Stack trace identified: {error_type}")
-        hotfix = f"# Generic Safe Execution Hotfix for {error_type}:\ntry:\n    # Protected operation block\n    pass\nexcept Exception as err:\n    print(f'Handled incident safely: {{err}}')"
+    # CWE-95: eval / exec
+    eval_matches = re.finditer(r'\b(eval|exec)\s*\(', code_str)
+    for m in eval_matches:
+        line_no = code_str[:m.start()].count('\n') + 1
+        issues.append({
+            "cwe": "CWE-95",
+            "title": "Improper Neutralization of Directives in Dynamically Evaluated Code (eval/exec)",
+            "severity": "CRITICAL",
+            "line": line_no,
+            "fix": "Replace with ast.literal_eval() or safe dictionary parsing."
+        })
 
+    # CWE-89: SQL Injection
+    sql_patterns = re.finditer(r'execute\s*\(\s*f?[\'"].*(?:SELECT|INSERT|UPDATE|DELETE).*(?:%s|\{|\+)', code_str, re.IGNORECASE)
+    for m in sql_patterns:
+        line_no = code_str[:m.start()].count('\n') + 1
+        issues.append({
+            "cwe": "CWE-89",
+            "title": "SQL Injection Flaw via Unsanitized String Formatting",
+            "severity": "HIGH",
+            "line": line_no,
+            "fix": "Use parameterized queries: cursor.execute('SELECT ... WHERE id = %s', (val,))"
+        })
+
+    # CWE-798: Hardcoded Credentials
+    secret_matches = re.finditer(r'(api_key|secret|password|token)\s*=\s*[\'"][a-zA-Z0-9_\-]{8,}[\'"]', code_str, re.IGNORECASE)
+    for m in secret_matches:
+        line_no = code_str[:m.start()].count('\n') + 1
+        issues.append({
+            "cwe": "CWE-798",
+            "title": "Hardcoded Sensitive Credential or Secret",
+            "severity": "MEDIUM",
+            "line": line_no,
+            "fix": "Extract credential to environment variables: os.getenv('SECRET_KEY')"
+        })
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# API Routes: Dedicated Analysis Modules
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+def health_check():
     return {
-        "complexity": f"Line {line_info}" if line_info else "N/A",
-        "issues": 1 if file_info != "Unknown" else 0,
-        "suggestions": suggestions,
-        "hotfix": hotfix
+        "status": "online",
+        "service": "CodeOpt AI Enterprise Engine",
+        "model": "ibm-granite/granite-3.0-8b-instruct",
+        "docs": "/docs"
     }
 
+@app.post("/analyze/complexity")
+def analyze_complexity(req: CodeRequest):
+    complexity, details = detect_ast_complexity(req.code)
+    return {
+        "complexity": complexity,
+        "details": details,
+        "code_length": len(req.code)
+    }
 
-# 2. Optimization Engine Endpoint
-@app.post("/optimize")
-def optimize_code(data: CodeRequest):
-    comp, recs = detect_ast_complexity(data.code)
-    optimized_snippet = data.code
-    if "N^2" in comp or "N^3" in comp:
-        optimized_comp = "O(N)"
-        recs.append("Refactored nested lookup using hash-set indexing for linear performance.")
-        optimized_snippet = (
-            "# Optimized Implementation (O(N) Set Lookup):\n"
-            "def optimized_solution(dataset, targets):\n"
-            "    target_set = set(targets)  # O(1) membership lookup\n"
-            "    return [item for item in dataset if item in target_set]"
-        )
+@app.post("/analyze/incident")
+def analyze_incident(req: IncidentRequest):
+    logs = []
+    error_line = None
+    error_type = "Generic Issue"
+
+    if req.traceback:
+        line_match = re.search(r'line\s+(\d+)', req.traceback)
+        err_match = re.search(r'([A-Za-z]+Error:[^\n]+)', req.traceback)
+        if line_match:
+            error_line = int(line_match.group(1))
+        if err_match:
+            error_type = err_match.group(1)
+        logs.append(f"Parsed stack trace: {error_type} at line {error_line}")
     else:
-        optimized_comp = comp
-        recs.append("Code is already operating near optimal complexity.")
+        logs.append("No stack trace supplied. Executing pure source inspection.")
+
+    complexity, comp_details = detect_ast_complexity(req.code)
+    vulns = scan_cwe_vulnerabilities(req.code)
 
     return {
-        "original_complexity": comp,
-        "optimized_complexity": optimized_comp,
-        "recommendations": recs,
-        "optimized_code": optimized_snippet
+        "error_type": error_type,
+        "error_line": error_line,
+        "complexity": complexity,
+        "complexity_details": comp_details,
+        "vulnerabilities": vulns,
+        "logs": logs
     }
 
+@app.post("/security/audit-and-patch")
+def security_audit_patch(req: SecurityRequest):
+    issues = scan_cwe_vulnerabilities(req.code)
+    patched_code = req.code
 
-# 3. Performance Profiling Endpoint
-@app.post("/performance")
-def benchmark_code(data: CodeRequest):
-    start_time = time.perf_counter()
-    lines_count = len([line for line in data.code.splitlines() if line.strip()])
-    duration_ms = round((time.perf_counter() - start_time) * 1000 + (lines_count * 0.42), 2)
-    
-    bottlenecks = []
-    if "for " in data.code and "+=" in data.code:
-        bottlenecks.append("In-place string or list concatenation inside loop detected. Prefer ''.join() or list comprehension.")
-    if "range(len(" in data.code:
-        bottlenecks.append("Anti-pattern 'range(len(...))' detected. Prefer direct enumeration with enumerate().")
-    if not bottlenecks:
-        bottlenecks.append("No obvious memory-thrashing patterns detected.")
+    # Patch eval
+    patched_code = re.sub(r'\beval\(([^)]+)\)', r'ast.literal_eval(\1)', patched_code)
+    # Patch SQL injection
+    patched_code = re.sub(
+        r'cursor\.execute\s*\(\s*f?[\'"]([^"\']+)[\'"]\s*\)',
+        r'cursor.execute("SELECT * FROM safe_records WHERE id = %s", (record_id,))',
+        patched_code
+    )
+    # Patch hardcoded secrets
+    patched_code = re.sub(
+        r'((?:api_key|secret|password|token)\s*=\s*)[\'"][^\'"]+[\'"]',
+        r'\1os.getenv("SECRET_KEY", "prod-secure-token")',
+        patched_code,
+        flags=re.IGNORECASE
+    )
 
     return {
-        "execution_time_estimate": f"{duration_ms} ms",
-        "memory_footprint": f"{round(max(0.8, lines_count * 0.15), 1)} MB",
-        "cpu_cycles": "Nominal" if lines_count < 100 else "High I/O Load",
-        "bottlenecks": bottlenecks
+        "issues_found": len(issues),
+        "issues": issues,
+        "patched_code": patched_code
     }
 
+@app.post("/verify/regression")
+def verify_regression(req: VerificationRequest):
+    code = req.code
+    checks = {
+        "syntax_compilation": False,
+        "defensive_guards": False,
+        "algorithmic_complexity": True,
+        "security_hardening": False,
+        "regression_safety": False
+    }
 
-# 4. Multi-Step Verification & Regression Endpoint
-@app.post("/verify")
-def verify_solution(data: CodeRequest):
-    code = data.code.strip()
-    test_results = []
-    
-    # Test 1: Python AST Syntax & Structure
+    # 1. Syntax check via AST
     try:
         ast.parse(code)
-        test_results.append({
-            "step": 1,
-            "name": "AST Syntax Compilation",
-            "status": "PASSED",
-            "detail": "Python syntax parsed with valid tokens, correct indentation, and matched delimiters."
-        })
-    except SyntaxError as e:
-        test_results.append({
-            "step": 1,
-            "name": "AST Syntax Compilation",
-            "status": "FAILED",
-            "detail": f"SyntaxError on line {e.lineno}: {e.msg} (near '{e.text.strip() if e.text else ''}'). Code cannot compile."
-        })
+        checks["syntax_compilation"] = True
+    except SyntaxError:
+        checks["syntax_compilation"] = False
 
-    # Test 2: Unbounded Loop & Recursion Risk
-    if "while True" in code and "break" not in code and "return" not in code:
-        test_results.append({
-            "step": 2,
-            "name": "Loop Termination & Halting Check",
-            "status": "FAILED",
-            "detail": "Detected 'while True' loop without a clear exit condition ('break' or 'return'). Risk of infinite freeze."
-        })
-    else:
-        test_results.append({
-            "step": 2,
-            "name": "Loop Termination & Halting Check",
-            "status": "PASSED",
-            "detail": "All loops bounded or provide explicit termination logic."
-        })
+    # 2. Defensive check
+    checks["defensive_guards"] = ("if not" in code or ".get(" in code or "try:" in code)
 
-    # Test 3: Null Safety & Exception Guarding
-    if any(k in code for k in ["['", "].", "/ 0", "int(None)"]) and "try:" not in code and ".get(" not in code:
-        test_results.append({
-            "step": 3,
-            "name": "Null Safety & Exception Guarding",
-            "status": "WARNING",
-            "detail": "Direct dictionary/pointer access found without try-except guard or safe lookup (.get)."
-        })
-    else:
-        test_results.append({
-            "step": 3,
-            "name": "Null Safety & Exception Guarding",
-            "status": "PASSED",
-            "detail": "Safe attribute access or protected operational blocks verified."
-        })
+    # 3. Security check
+    checks["security_hardening"] = not bool(re.search(r'\b(eval|exec)\s*\(', code))
 
-    # Test 4: Boundary & Edge Case Handling
-    if "len(" in code or "if not " in code or "is None" in code or ".get(" in code:
-        test_results.append({
-            "step": 4,
-            "name": "Boundary & Edge Case Handling",
-            "status": "PASSED",
-            "detail": "Code contains explicit guards against empty sequences, None values, or 0-length iterations."
-        })
-    else:
-        test_results.append({
-            "step": 4,
-            "name": "Boundary & Edge Case Handling",
-            "status": "FAILED",
-            "detail": "Missing defensive edge checks for null or empty collections."
-        })
+    # 4. Complexity check
+    try:
+        tree = ast.parse(code)
+        visitor = LoopDepthVisitor()
+        visitor.visit(tree)
+        checks["algorithmic_complexity"] = (visitor.max_depth <= 1)
+    except Exception:
+        checks["algorithmic_complexity"] = False
 
-    # Test 5: Static Security & Arbitrary Execution Audit
-    dangerous_calls = ["eval(", "exec(", "__import__", "os.system"]
-    found_dangerous = [d for d in dangerous_calls if d in code]
-    if found_dangerous:
-        test_results.append({
-            "step": 5,
-            "name": "Security & Code Injection Check",
-            "status": "FAILED",
-            "detail": f"Unsafe execution vector detected: found dangerous call {', '.join(found_dangerous)}."
-        })
-    else:
-        test_results.append({
-            "step": 5,
-            "name": "Security & Code Injection Check",
-            "status": "PASSED",
-            "detail": "No dynamic arbitrary evaluation (eval/exec) or unsafe execution patterns found."
-        })
+    # 5. Deterministic safety
+    checks["regression_safety"] = checks["syntax_compilation"] and checks["security_hardening"]
 
-    passed_count = sum(1 for t in test_results if t["status"] == "PASSED")
-    total_count = len(test_results)
-    is_safe = passed_count >= 4 and test_results[0]["status"] == "PASSED"
+    score = sum(1 for v in checks.values() if v)
 
     return {
-        "status": "Verified Safe" if is_safe else "Verification Failed",
-        "regression_risk": "Low" if is_safe else "High",
-        "test_cases_passed": f"{passed_count}/{total_count} Passed",
-        "lint_check": "Clean" if test_results[0]["status"] == "PASSED" else test_results[0]["detail"],
-        "detailed_steps": test_results
+        "score": f"{score}/5",
+        "passed": (score == 5),
+        "checks": checks
     }
 
 
-# 5. Security Patching & Hardening Endpoint
-@app.post("/security-patch")
-def security_patch(data: CodeRequest):
-    code = data.code.strip()
-    vulnerabilities = []
-    patched_code = code
+# ---------------------------------------------------------------------------
+# Orchestrated Autonomous Pipeline (Self-Healing)
+# ---------------------------------------------------------------------------
 
-    # 1. Arbitrary Code Execution (eval / exec)
-    if "eval(" in code or "exec(" in code:
-        vulnerabilities.append({
-            "cwe": "CWE-95",
-            "name": "Improper Neutralization of Directives in Dynamically Evaluated Code",
-            "severity": "CRITICAL",
-            "description": "Direct use of eval() or exec() allows untrusted input to execute arbitrary Python commands.",
-            "recommendation": "Replace dynamic evaluation with ast.literal_eval for structured data, or use safe dictionary dispatch."
-        })
-        patched_code = re.sub(
-            r'eval\((.*?)\)',
-            r'ast.literal_eval(\1)  # Patched: safe literal parsing without code execution',
-            patched_code
-        )
+@app.post("/pipeline/auto-heal")
+async def autonomous_heal_pipeline(req: PipelineRequest):
+    start_time = time.time()
+    current_code = req.code
+    logs = ["[Orchestrator]: Triggered Autonomous Multi-Agent Pipeline."]
 
-    # 2. Command Injection (os.system / subprocess with shell=True)
-    if "os.system(" in code or "shell=True" in code:
-        vulnerabilities.append({
-            "cwe": "CWE-78",
-            "name": "OS Command Injection",
-            "severity": "HIGH",
-            "description": "Invoking system commands through a shell allows attackers to append arbitrary shell operators (e.g. ';', '&&').",
-            "recommendation": "Use subprocess.run() with a tokenized argument list and shell=False."
-        })
-        patched_code = re.sub(
-            r'os\.system\((.*?)\)',
-            r'import subprocess\n# Patched: Tokenized argument execution without shell access\nsubprocess.run([\1], check=True, shell=False)',
-            patched_code
-        )
+    # Step 1: Prompt IBM Granite 3.0 via Hugging Face Router
+    logs.append("[IBM Granite]: Submitting source context & traceback to Granite 3.0 foundation model...")
+    ai_prompt = f"""You are the master automated code optimization and repair bot powered by IBM Granite 3.0.
+Analyze the following Python source code and runtime crash traceback, then refactor it:
+1. Fix any runtime crashes (IndexError, KeyError, TypeError, NoneType).
+2. Refactor quadratic nested loops O(N^2) into linear O(N) using set or dict lookup indexing.
+3. Patch all security flaws (replace eval() with ast.literal_eval, parameterize SQL queries, remove hardcoded keys).
+4. Ensure 100% syntactically correct, production-grade Python code.
 
-    # 3. SQL Injection via String Formatting
-    if re.search(r'(SELECT|INSERT|UPDATE|DELETE).*(%s|\.format|\+.*f")', code, re.IGNORECASE) or re.search(r'f["\'].*SELECT.*\{', code, re.IGNORECASE):
-        vulnerabilities.append({
-            "cwe": "CWE-89",
-            "name": "SQL Injection (SQLi)",
-            "severity": "CRITICAL",
-            "description": "SQL statement constructed dynamically using untrusted string formatting or interpolation.",
-            "recommendation": "Use parameterized queries or ORM abstractions where values are passed separately from query structure."
-        })
-        patched_code = (
-            "# Patched: Parameterized query implementation\n"
-            "cursor.execute(\"SELECT * FROM users WHERE username = ?\", (user_input,))"
-        )
+Return ONLY the refactored, executable Python code with no markdown formatting and no prose explanation.
 
-    # 4. Insecure Deserialization (pickle)
-    if "pickle.loads(" in code or "pickle.load(" in code:
-        vulnerabilities.append({
-            "cwe": "CWE-502",
-            "name": "Insecure Deserialization",
-            "severity": "HIGH",
-            "description": "Unpickling data from untrusted sources can trigger automatic object instantiation and code execution via __reduce__.",
-            "recommendation": "Use safe data exchange formats such as JSON, Protocol Buffers, or messagepack."
-        })
-        patched_code = re.sub(
-            r'pickle\.loads?\((.*?)\)',
-            r'json.loads(\1)  # Patched: safe JSON deserialization',
-            patched_code
-        )
+[TRACEBACK]
+{req.traceback if req.traceback else 'No crash log provided'}
 
-    # 5. Hardcoded Credentials / Secrets
-    if re.search(r'(api_key|password|secret|token)\s*=\s*["\'][A-Za-z0-9_\-]{8,}["\']', code, re.IGNORECASE):
-        vulnerabilities.append({
-            "cwe": "CWE-798",
-            "name": "Use of Hardcoded Credentials",
-            "severity": "MEDIUM",
-            "description": "Plaintext API keys or credentials committed to source code risk credential leakage.",
-            "recommendation": "Retrieve sensitive configuration dynamically from environment variables or a vault manager."
-        })
-        patched_code = re.sub(
-            r'(api_key|password|secret|token)\s*=\s*["\'].*?["\']',
-            r'import os\n\1 = os.getenv("\1".upper(), "")  # Patched: loaded from environment variable',
-            patched_code,
-            flags=re.IGNORECASE
-        )
+[SOURCE CODE]
+{current_code}
+"""
+    ai_result = query_watsonx_agent(ai_prompt, fallback_code="")
+
+    if ai_result and ai_result.strip():
+        current_code = ai_result.strip()
+        logs.append("[IBM Granite]: Foundation model generated healed code candidate.")
+    else:
+        logs.append("[Fallback Engine]: Running deterministic AST and regex refactor passes.")
+        # Local fallback: patch eval and bounds
+        current_code = re.sub(r'\beval\(([^)]+)\)', r'ast.literal_eval(\1)', current_code)
+        if "IndexError" in (req.traceback or ""):
+            current_code = re.sub(
+                r'(\w+)\[([^\]]+)\]',
+                r'(\1[\2] if \2 < len(\1) else None)',
+                current_code,
+                count=1
+            )
+
+    # Step 2: Run Automated 5-Point Verification Suite
+    logs.append("[Verifier Agent]: Executing 5-point verification and regression checks...")
+    checks = {
+        "syntax_compilation": False,
+        "defensive_guards": False,
+        "algorithmic_complexity": True,
+        "security_hardening": False,
+        "regression_safety": False
+    }
+
+    try:
+        tree = ast.parse(current_code)
+        checks["syntax_compilation"] = True
+        
+        visitor = LoopDepthVisitor()
+        visitor.visit(tree)
+        checks["algorithmic_complexity"] = (visitor.max_depth <= 1)
+    except SyntaxError:
+        checks["syntax_compilation"] = False
+        checks["algorithmic_complexity"] = False
+
+    checks["defensive_guards"] = ("if not" in current_code or ".get(" in current_code or "try:" in current_code)
+    checks["security_hardening"] = not bool(re.search(r'\b(eval|exec)\s*\(', current_code))
+    checks["regression_safety"] = checks["syntax_compilation"] and checks["security_hardening"]
+
+    score = sum(1 for v in checks.values() if v)
+    logs.append(f"[Verifier Agent]: Multi-layer checks complete. Score: {score}/5 passed.")
+
+    duration_ms = round((time.time() - start_time) * 1000, 2)
+    logs.append(f"[Orchestrator]: Auto-healing lifecycle concluded in {duration_ms}ms.")
 
     return {
-        "vulnerabilities_found": len(vulnerabilities),
-        "vulnerabilities": vulnerabilities,
-        "is_clean": len(vulnerabilities) == 0,
-        "patched_code": patched_code if vulnerabilities else "# No known security vulnerabilities detected. Code passes standard rules."
+        "healed_code": current_code,
+        "score": f"{score}/5",
+        "checks": checks,
+        "logs": logs,
+        "execution_time_ms": duration_ms
+    }
+
+
+# ---------------------------------------------------------------------------
+# Universal Omni-Agent (Arbitrary Developer Tasks)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/omni-agent")
+async def omni_agent_handler(req: UniversalTaskRequest):
+    """
+    Universal instruction interface powered by IBM Granite 3.0.
+    Accepts any custom user prompt, code snippet, or conversion task.
+    """
+    prompt = (
+        f"You are an expert AI software engineer powered by IBM Granite 3.0.\n"
+        f"Your task is: {req.instruction}\n\n"
+        f"Context / Code / Input provided:\n"
+        f"```{req.language}\n"
+        f"{req.code_or_input}\n"
+        f"```\n\n"
+        f"Follow the instruction precisely. If generating code, produce clean, production-grade implementations."
+    )
+
+    ai_response = query_watsonx_agent(prompt, fallback_code="AI processing unavailable. Verify HF_API_TOKEN environment variable.")
+    
+    return {
+        "status": "success",
+        "instruction": req.instruction,
+        "result": ai_response
     }
